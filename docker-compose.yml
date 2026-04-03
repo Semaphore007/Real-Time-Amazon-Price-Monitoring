@@ -1,9 +1,13 @@
 version: "3.9"
 
 services:
+  # ── FastAPI Backend ────────────────────────────────────────────────────────
   api:
     build: .
-    command: uvicorn api.fastapi_app:app --host 0.0.0.0 --port 8000
+    command: >
+      uvicorn api.fastapi_app:app
+        --host 0.0.0.0 --port 8000
+        --workers 2 --log-level info
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -11,24 +15,36 @@ services:
       APP_ENV: production
       SEED_DEMO_DATA: "false"
       DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/amazon_monitor
+      REDIS_URL: redis://redis:6379/0
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
 
-  dashboard:
-    build: .
-    command: streamlit run dashboard.py --server.address 0.0.0.0 --server.port 8501
-    restart: unless-stopped
+  # ── Next.js Dashboard Frontend ─────────────────────────────────────────────
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    command: sh -c "npm install && npm run build && npm start"
     ports:
-      - "8501:8501"
+      - "3000:3000"
     environment:
-      APP_ENV: production
-      SEED_DEMO_DATA: "false"
-      DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/amazon_monitor
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NODE_ENV: production
     depends_on:
-      db:
+      api:
         condition: service_healthy
+    restart: unless-stopped
 
+  # ── Scrapy Scheduler ───────────────────────────────────────────────────────
   scheduler:
     build: .
     command: python -m scheduler.scheduler --interval-minutes 30
@@ -37,12 +53,31 @@ services:
       APP_ENV: production
       SEED_DEMO_DATA: "false"
       DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/amazon_monitor
+      REDIS_URL: redis://redis:6379/0
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
 
+  # ── Celery Worker (for async tasks) ───────────────────────────────────────
+  celery_worker:
+    build: .
+    command: celery -A scheduler.celery_app worker --loglevel=info --concurrency=2
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/amazon_monitor
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
   db:
-    image: postgres:16
+    image: postgres:16-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: amazon_monitor
@@ -58,5 +93,35 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_data:/data
+
+  # ── Streamlit Analytics (optional) ────────────────────────────────────────
+  streamlit:
+    build: .
+    command: streamlit run dashboard/streamlit_app.py --server.address 0.0.0.0 --server.port 8501
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    environment:
+      APP_ENV: production
+      SEED_DEMO_DATA: "false"
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/amazon_monitor
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   postgres_data:
+  redis_data:
